@@ -1,182 +1,174 @@
-export const config = { runtime: 'edge' };
+const TURNSTILE_SECRET = process.env.TURNSTILE_SECRET_KEY;
+const SLACK_WEBHOOK = process.env.SLACK_CONTACT_WEBHOOK;
 
-import { ConvexHttpClient } from 'convex/browser';
-import { getCorsHeaders, isDisallowedOrigin } from './_cors.js';
-import { getClientIp, verifyTurnstile } from './_turnstile.js';
-import { jsonResponse } from './_json-response.js';
-import { createIpRateLimiter } from './_ip-rate-limit.js';
+// In-memory rate limiting store
+const rateLimitStore = new Map();
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PHONE_RE = /^[+(]?\d[\d\s()./-]{4,23}\d$/;
-const MAX_FIELD = 500;
-const MAX_MESSAGE = 2000;
+const RATE_LIMIT_WINDOW = 60 * 60 * 1000; // 1 hour
+const RATE_LIMIT_MAX = 5; // max requests per window
 
-const FREE_EMAIL_DOMAINS = new Set([
-  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.fr', 'yahoo.co.uk', 'yahoo.co.jp',
-  'hotmail.com', 'hotmail.fr', 'hotmail.co.uk', 'outlook.com', 'outlook.fr',
-  'live.com', 'live.fr', 'msn.com', 'aol.com', 'icloud.com', 'me.com', 'mac.com',
-  'protonmail.com', 'proton.me', 'mail.com', 'zoho.com', 'yandex.com', 'yandex.ru',
-  'gmx.com', 'gmx.net', 'gmx.de', 'web.de', 'mail.ru', 'inbox.com',
-  'fastmail.com', 'tutanota.com', 'tuta.io', 'hey.com',
-  'qq.com', '163.com', '126.com', 'sina.com', 'foxmail.com',
-  'rediffmail.com', 'ymail.com', 'rocketmail.com',
-  'wanadoo.fr', 'free.fr', 'laposte.net', 'orange.fr', 'sfr.fr',
-  't-online.de', 'libero.it', 'virgilio.it',
-]);
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const entry = rateLimitStore.get(ip);
 
-const RATE_LIMIT = 3;
-const RATE_WINDOW_MS = 60 * 60 * 1000;
-
-const rateLimiter = createIpRateLimiter({ limit: RATE_LIMIT, windowMs: RATE_WINDOW_MS });
-
-async function sendNotificationEmail(name, email, organization, phone, message) {
-  const resendKey = process.env.RESEND_API_KEY;
-  if (!resendKey) {
-    console.error('[contact] RESEND_API_KEY not set — lead stored in Convex but notification NOT sent');
-    return false;
+  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW) {
+    rateLimitStore.set(ip, { windowStart: now, count: 1 });
+    return { allowed: true, remaining: RATE_LIMIT_MAX - 1 };
   }
-  const notifyEmail = process.env.CONTACT_NOTIFY_EMAIL || 'elie.habib@gmail.com';
-  const emailDomain = (email.split('@')[1] || '').toLowerCase();
+
+  if (entry.count >= RATE_LIMIT_MAX) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  entry.count++;
+  return { allowed: true, remaining: RATE_LIMIT_MAX - entry.count };
+}
+
+async function verifyTurnstile(token, ip) {
+  if (!TURNSTILE_SECRET) return true;
   try {
-    const res = await fetch('https://api.resend.com/emails', {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${resendKey}`,
-      },
-      body: JSON.stringify({
-        from: 'World Monitor <noreply@worldmonitor.app>',
-        to: [notifyEmail],
-        subject: `[WM Enterprise] ${sanitizeForSubject(name)} from ${sanitizeForSubject(organization)}`,
-        html: `
-          <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto;">
-            <h2 style="color: #4ade80;">New Enterprise Contact</h2>
-            <table style="width: 100%; border-collapse: collapse;">
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Name</td><td style="padding: 8px;">${escapeHtml(name)}</td></tr>
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Email</td><td style="padding: 8px;"><a href="mailto:${escapeHtml(email)}">${escapeHtml(email)}</a></td></tr>
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Domain</td><td style="padding: 8px;"><a href="https://${escapeHtml(emailDomain)}" target="_blank">${escapeHtml(emailDomain)}</a></td></tr>
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Company</td><td style="padding: 8px;">${escapeHtml(organization)}</td></tr>
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Phone</td><td style="padding: 8px;"><a href="tel:${escapeHtml(phone)}">${escapeHtml(phone)}</a></td></tr>
-              <tr><td style="padding: 8px; font-weight: bold; color: #666;">Message</td><td style="padding: 8px;">${escapeHtml(message || 'N/A')}</td></tr>
-            </table>
-            <p style="color: #999; font-size: 12px; margin-top: 24px;">Sent from worldmonitor.app enterprise contact form</p>
-          </div>`,
-      }),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token)}&remoteip=${encodeURIComponent(ip || '')}`,
     });
-    if (!res.ok) {
-      const body = await res.text();
-      console.error(`[contact] Resend ${res.status}:`, body);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error('[contact] Resend error:', err);
+    const data = await res.json();
+    return data.success === true;
+  } catch {
     return false;
   }
 }
 
-function escapeHtml(str) {
-  return str
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+function calculateLeadScore({ company_size, use_case, deployment_timeline, email, budget }) {
+  let lead_score = 0;
+
+  // Company size scoring
+  const sizeScores = {
+    '1-10': 5,
+    '11-50': 10,
+    '51-200': 20,
+    '201-1000': 30,
+    '1000+': 40,
+  };
+  lead_score += sizeScores[company_size] || 5;
+
+  // Use case scoring
+  const useCaseScores = {
+    'enterprise_deployment': 25,
+    'team_integration': 20,
+    'api_access': 20,
+    'custom_solution': 15,
+    'evaluation': 10,
+    'personal': 5,
+  };
+  lead_score += useCaseScores[use_case] || 5;
+
+  // Deployment timeline scoring
+  const timelineScores = {
+    'immediate': 25,
+    '1_month': 20,
+    '1_3_months': 15,
+    '3_6_months': 10,
+    'exploratory': 5,
+  };
+  lead_score += timelineScores[deployment_timeline] || 5;
+
+  // Budget scoring
+  const budgetScores = {
+    'enterprise': 20,
+    'team': 15,
+    'starter': 10,
+    'undecided': 5,
+  };
+  lead_score += budgetScores[budget] || 0;
+
+  // Corporate email bonus
+  if (email && !email.match(/@(gmail|yahoo|hotmail|outlook|aol)\./i)) {
+    lead_score += 10;
+  }
+
+  return Math.min(lead_score, 100);
 }
 
-function sanitizeForSubject(str, maxLen = 50) {
-  return str.replace(/[\r\n\0]/g, '').slice(0, maxLen);
+function isQualifiedLead(lead_score, { company_size, deployment_timeline }) {
+  if (lead_score >= 50) return true;
+  if (company_size === '1000+' && deployment_timeline === 'immediate') return true;
+  return false;
 }
 
-export default async function handler(req) {
-  if (isDisallowedOrigin(req)) {
-    return jsonResponse({ error: 'Origin not allowed' }, 403);
-  }
-
-  const cors = getCorsHeaders(req, 'POST, OPTIONS');
-
-  if (req.method === 'OPTIONS') {
-    return new Response(null, { status: 204, headers: cors });
-  }
-
-  if (req.method !== 'POST') {
-    return jsonResponse({ error: 'Method not allowed' }, 405, cors);
-  }
-
-  const ip = getClientIp(req);
-
-  if (rateLimiter.isRateLimited(ip)) {
-    return jsonResponse({ error: 'Too many requests' }, 429, cors);
-  }
-
-  let body;
+async function notifySlack({ name, email, company, company_size, use_case, deployment_timeline, message, lead_score, qualified_lead }) {
+  if (!SLACK_WEBHOOK) return;
   try {
-    body = await req.json();
-  } catch {
-    return jsonResponse({ error: 'Invalid JSON' }, 400, cors);
-  }
-
-  if (body.website) {
-    return jsonResponse({ status: 'sent' }, 200, cors);
-  }
-
-  const turnstileOk = await verifyTurnstile({
-    token: body.turnstileToken || '',
-    ip,
-    logPrefix: '[contact]',
-    missingSecretPolicy: 'allow-in-development',
-  });
-  if (!turnstileOk) {
-    return jsonResponse({ error: 'Bot verification failed' }, 403, cors);
-  }
-
-  const { email, name, organization, phone, message, source } = body;
-
-  if (!email || typeof email !== 'string' || !EMAIL_RE.test(email)) {
-    return jsonResponse({ error: 'Invalid email' }, 400, cors);
-  }
-
-  const emailDomain = email.split('@')[1]?.toLowerCase();
-  if (emailDomain && FREE_EMAIL_DOMAINS.has(emailDomain)) {
-    return jsonResponse({ error: 'Please use your work email address' }, 422, cors);
-  }
-
-  if (!name || typeof name !== 'string' || name.trim().length === 0) {
-    return jsonResponse({ error: 'Name is required' }, 400, cors);
-  }
-  if (!organization || typeof organization !== 'string' || organization.trim().length === 0) {
-    return jsonResponse({ error: 'Company is required' }, 400, cors);
-  }
-  if (!phone || typeof phone !== 'string' || !PHONE_RE.test(phone.trim())) {
-    return jsonResponse({ error: 'Valid phone number is required' }, 400, cors);
-  }
-
-  const safeName = name.slice(0, MAX_FIELD);
-  const safeOrg = organization.slice(0, MAX_FIELD);
-  const safePhone = phone.trim().slice(0, 30);
-  const safeMsg = typeof message === 'string' ? message.slice(0, MAX_MESSAGE) : undefined;
-  const safeSource = typeof source === 'string' ? source.slice(0, 100) : 'enterprise-contact';
-
-  const convexUrl = process.env.CONVEX_URL;
-  if (!convexUrl) {
-    return jsonResponse({ error: 'Service unavailable' }, 503, cors);
-  }
-
-  try {
-    const client = new ConvexHttpClient(convexUrl);
-    await client.mutation('contactMessages:submit', {
-      name: safeName,
-      email: email.trim(),
-      organization: safeOrg,
-      phone: safePhone,
-      message: safeMsg,
-      source: safeSource,
+    const qualifiedEmoji = qualified_lead ? '🔥' : '📋';
+    const text = `${qualifiedEmoji} *New Contact Form Submission*\n` +
+      `*Name:* ${name}\n*Email:* ${email}\n*Company:* ${company || 'N/A'}\n` +
+      `*Company Size:* ${company_size || 'N/A'}\n*Use Case:* ${use_case || 'N/A'}\n` +
+      `*Deployment Timeline:* ${deployment_timeline || 'N/A'}\n` +
+      `*Lead Score:* ${lead_score}/100\n*Qualified Lead:* ${qualified_lead ? 'YES' : 'No'}\n` +
+      `*Message:* ${message || 'N/A'}`;
+    await fetch(SLACK_WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
     });
+  } catch { /* best-effort */ }
+}
 
-    const emailSent = await sendNotificationEmail(safeName, email.trim(), safeOrg, safePhone, safeMsg);
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    return jsonResponse({ status: 'sent', emailSent }, 200, cors);
-  } catch (err) {
-    console.error('[contact] error:', err);
-    return jsonResponse({ error: 'Failed to send message' }, 500, cors);
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+
+  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+  const rateCheck = checkRateLimit(ip);
+  if (!rateCheck.allowed) {
+    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
   }
+
+  const { name, email, company, company_size, use_case, deployment_timeline, budget, message, turnstile_token } = req.body || {};
+
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Name and email are required.' });
+  }
+
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Invalid email address.' });
+  }
+
+  const turnstileValid = await verifyTurnstile(turnstile_token, ip);
+  if (!turnstileValid) {
+    return res.status(403).json({ error: 'Bot verification failed. Please try again.' });
+  }
+
+  const lead_score = calculateLeadScore({ company_size, use_case, deployment_timeline, email, budget });
+  const qualified_lead = isQualifiedLead(lead_score, { company_size, deployment_timeline });
+
+  const submission = {
+    name,
+    email,
+    company: company || null,
+    company_size: company_size || null,
+    use_case: use_case || null,
+    deployment_timeline: deployment_timeline || null,
+    budget: budget || null,
+    message: message || null,
+    lead_score,
+    qualified_lead,
+    submitted_at: new Date().toISOString(),
+    ip_hash: Buffer.from(ip).toString('base64'),
+  };
+
+  await notifySlack(submission);
+
+  return res.status(200).json({
+    success: true,
+    message: qualified_lead
+      ? 'Thank you! A member of our enterprise team will reach out within 24 hours.'
+      : 'Thank you for your interest! We will be in touch soon.',
+    lead_score,
+    qualified_lead,
+  });
 }
